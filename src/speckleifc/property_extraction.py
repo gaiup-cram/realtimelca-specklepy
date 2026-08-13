@@ -1,7 +1,8 @@
 import math
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 from ifcopenshell.entity_instance import entity_instance
+from ifcopenshell.util.classification import get_classification, get_references
 from ifcopenshell.util.element import get_type
 from ifcopenshell.util.unit import get_full_unit_name, get_project_unit
 
@@ -26,6 +27,9 @@ def extract_properties(element: entity_instance) -> dict[str, object]:
     if qtos:
         properties["Quantities"] = qtos
 
+    if classifications := _get_classifications(element):
+        properties["Classifications"] = classifications
+
     if (ifc_type := get_type(element)) is not None:
         properties["Element Type Property Sets"] = _get_ifc_element_type_properties(
             ifc_type,
@@ -39,6 +43,67 @@ def extract_properties(element: entity_instance) -> dict[str, object]:
 
 def _get_attributes(element: entity_instance) -> dict[str, object]:
     return element.get_info(True, False, scalar_only=True)
+
+
+def _get_classification_identification(reference: entity_instance) -> Optional[str]:
+    """IFC2X3 calls this ItemReference; IFC4 renamed it to Identification."""
+    return getattr(reference, "Identification", None) or getattr(
+        reference, "ItemReference", None
+    )
+
+
+def _get_classifications(element: entity_instance) -> dict[str, object]:
+    """
+    Classification references associated via IfcRelAssociatesClassification.
+
+    Keyed by the owning IfcClassification's name (e.g. "Uniclass 2015"), so a
+    consumer that knows which system it cares about can look the code up directly.
+
+    `get_references` already handles inheriting references from the element type
+    and letting occurrence-level references override type-level ones per system.
+
+    An element is not supposed to carry more than one reference per system, but
+    nothing in the schema prevents it. We keep one entry per system rather than
+    nest a list, since the common case is 1:1 and callers look codes up by system
+    name. `get_references` returns a set, whose iteration order is incidental
+    rather than guaranteed, so sort first: the lowest Identification wins, and
+    which one that is does not depend on set internals.
+
+    ReferencedSource is optional, so a reference need not belong to any
+    IfcClassification. Those are skipped: with no system there is no stable key
+    to file them under, and falling back to the reference's own name invents
+    keys that look like systems but are not. Real exports lean on this - one
+    ArchiCAD file had 619 IfcSpaces carrying sourceless references for Finnish
+    area categories ("Huoneala", "Bruttoala"), which would otherwise have
+    surfaced as ~20 spurious classification systems.
+    """
+    result: dict[str, object] = {}
+
+    references = sorted(
+        get_references(element),
+        key=lambda r: (
+            _get_classification_identification(r) or "",
+            r.Name or "",
+            r.id(),
+        ),
+    )
+
+    for reference in references:
+        system = get_classification(reference)
+        if system is None or not system.Name:
+            continue
+
+        # First wins, so the entry is stable when a system appears more than once.
+        result.setdefault(
+            system.Name,
+            {
+                "Identification": _get_classification_identification(reference),
+                "Name": reference.Name,
+                "Location": getattr(reference, "Location", None),
+            },
+        )
+
+    return result
 
 
 def _get_ifc_element_type_properties(element: entity_instance) -> dict[str, object]:
