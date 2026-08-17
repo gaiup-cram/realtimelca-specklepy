@@ -19,8 +19,12 @@ from speckle_automate.schema import (
 from specklepy.api import operations
 from specklepy.api.client import SpeckleClient
 from specklepy.core.api.inputs.model_inputs import CreateModelInput
-from specklepy.core.api.inputs.version_inputs import CreateVersionInput
+from specklepy.core.api.inputs.version_inputs import (
+    CreateVersionInput,
+    MarkReceivedVersionInput,
+)
 from specklepy.core.api.models.current import Model, Version
+from specklepy.logging import metrics
 from specklepy.logging.exceptions import SpeckleException
 from specklepy.objects.base import Base
 from specklepy.transports.memory import MemoryTransport
@@ -66,6 +70,7 @@ class AutomationContext:
             if isinstance(automation_run_data, AutomationRunData)
             else AutomationRunData.model_validate_json(automation_run_data)
         )
+        metrics.set_host_app("automate")
         speckle_client = SpeckleClient(
             automation_run_data.speckle_server_url,
             automation_run_data.speckle_server_url.startswith("https"),
@@ -100,6 +105,7 @@ class AutomationContext:
         """Receive the Speckle project version that triggered this automation run."""
         # TODO: this is a quick hack to keep implementation consistency.
         # Move to proper receive many versions
+        project_id = self.automation_run_data.project_id
         version_id = self.automation_run_data.triggers[0].payload.version_id
         try:
             version = self.speckle_client.version.get(
@@ -109,7 +115,7 @@ class AutomationContext:
             raise ValueError(
                 f"""Could not receive specified version.
                 Is your environment configured correctly?
-                project_id: {self.automation_run_data.project_id}
+                project_id: {project_id}
                 model_id: {self.automation_run_data.triggers[0].payload.model_id}
                 version_id: {self.automation_run_data.triggers[0].payload.version_id}
                 """
@@ -123,6 +129,13 @@ class AutomationContext:
 
         base = operations.receive(
             version.referenced_object, self._server_transport, self._memory_transport
+        )
+        self.speckle_client.version.received(
+            MarkReceivedVersionInput(
+                version_id=version_id,
+                project_id=project_id,
+                source_application="automate_function",
+            )
         )
         # self._closure_tree = base["__closure"]
         print(
@@ -245,24 +258,24 @@ class AutomationContext:
         """
         )
         if self.run_status in [AutomationStatus.SUCCEEDED, AutomationStatus.FAILED]:
-            object_results = {
-                "version": 2,
+            results_dict = self._automation_result.model_dump(by_alias=True)
+            results = {
+                "version": 3,
                 "values": {
-                    "objectResults": self._automation_result.model_dump(by_alias=True)[
-                        "objectResults"
-                    ],
+                    "objectResults": results_dict["objectResults"],
+                    "versionResult": results_dict["versionResult"],
                     "blobIds": self._automation_result.blobs,
                 },
             }
         else:
-            object_results = None
+            results = None
 
         params = {
             "projectId": self.automation_run_data.project_id,
             "functionRunId": self.automation_run_data.function_run_id,
             "status": self.run_status.value,
             "statusMessage": self._automation_result.status_message,
-            "results": object_results,
+            "results": results,
             "contextView": self._automation_result.result_view,
         }
         print(f"Reporting run status with content: {params}")
@@ -312,25 +325,49 @@ class AutomationContext:
 
         return upload_response.upload_results[0].blob_id
 
-    def mark_run_failed(self, status_message: str) -> None:
-        """Mark the current run a failure."""
-        self._mark_run(AutomationStatus.FAILED, status_message)
+    def mark_run_failed(
+        self, status_message: str, version_result: dict[str, Any] | None = None
+    ) -> None:
+        """
+        Mark the current run a failure.
+
+        Args:
+            status_message: Optional message to be displayed.
+            version_result: Optional data object,
+                that will be attached to the run results.
+                The dictionary should be JSON serializable
+        """
+        self._mark_run(AutomationStatus.FAILED, status_message, version_result)
 
     def mark_run_exception(self, status_message: str) -> None:
         """Mark the current run a failure."""
-        self._mark_run(AutomationStatus.EXCEPTION, status_message)
+        self._mark_run(AutomationStatus.EXCEPTION, status_message, None)
 
-    def mark_run_success(self, status_message: Optional[str]) -> None:
-        """Mark the current run a success with an optional message."""
-        self._mark_run(AutomationStatus.SUCCEEDED, status_message)
+    def mark_run_success(
+        self, status_message: str | None, version_result: dict[str, Any] | None = None
+    ) -> None:
+        """
+        Mark the current run a success with an optional message.
+
+        Args:
+            status_message: Optional message to be displayed.
+            version_result: Optional data object,
+                that will be attached to the run results.
+                The dictionary should be JSON serializable
+        """
+        self._mark_run(AutomationStatus.SUCCEEDED, status_message, version_result)
 
     def _mark_run(
-        self, status: AutomationStatus, status_message: Optional[str]
+        self,
+        status: AutomationStatus,
+        status_message: str | None,
+        version_result: dict[str, Any] | None,
     ) -> None:
         duration = self.elapsed()
         self._automation_result.status_message = status_message
         self._automation_result.run_status = status
         self._automation_result.elapsed = duration
+        self._automation_result.version_result = version_result
 
         msg = f"Automation run {status.value} after {duration:.2f} seconds."
         print("\n".join([msg, status_message]) if status_message else msg)
@@ -456,29 +493,29 @@ class AutomationContext:
         Args:
             level: Result level.
             category (str): A short tag for the event type.
-            affected_objects (Union[Base, List[Base]]): A single object or a list of
-                objects that are causing the info case.
+            affected_objects (Union[Base, List[Base]]): A single object, a list of
+                objects, or an empty list. When empty, a result case is still
+                appended with no object IDs (e.g. for skipped rules or version-level
+                messages).
             message (Optional[str]): Optional message.
             metadata: User provided metadata key value pairs
             visual_overrides: Case specific 3D visual overrides.
         """
         if isinstance(affected_objects, list):
-            if len(affected_objects) < 1:
-                raise ValueError(
-                    f"Need atleast one object to report a(n) {level.value.upper()}"
-                )
             object_list = affected_objects
         else:
             object_list = [affected_objects]
 
         ids: Dict[str, Optional[str]] = {}
+        # When objects are provided, each must have an id (empty list allowed for
+        # version-level/skipped results).
         for o in object_list:
-            # validate that the Base.id is not None. If its a None, throw an Exception
-            if not o.id:
+            if not getattr(o, "id", None):
                 raise Exception(
                     f"You can only attach {level} results to objects with an id."
                 )
-            ids[o.id] = o.applicationId
+            ids[o.id] = getattr(o, "applicationId", None)
+
         print(
             f"Created new {level.value.upper()}"
             f" category: {category} caused by: {message}"

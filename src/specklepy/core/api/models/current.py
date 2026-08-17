@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Generic, List, TypeVar
 
-from specklepy.core.api.enums import ProjectVisibility
+from specklepy.core.api.enums import ModelIngestionStatus, ProjectVisibility
 from specklepy.core.api.models.graphql_base_model import GraphQLBaseModel
 from specklepy.logging.exceptions import WorkspacePermissionException
 
@@ -105,7 +105,7 @@ class PendingStreamCollaborator(GraphQLBaseModel):
     project_name: str
     title: str
     role: str
-    invited_by: LimitedUser
+    invited_by: LimitedUser | None = None
     user: LimitedUser | None = None
     token: str | None
 
@@ -137,6 +137,12 @@ class Version(GraphQLBaseModel):
     source_application: str | None
 
 
+class ModelPermissionChecks(GraphQLBaseModel):
+    can_update: "PermissionCheckResult"
+    can_delete: "PermissionCheckResult"
+    can_create_version: "PermissionCheckResult"
+
+
 class Model(GraphQLBaseModel):
     author: LimitedUser | None
     created_at: datetime
@@ -156,7 +162,6 @@ class ProjectPermissionChecks(GraphQLBaseModel):
     can_create_model: "PermissionCheckResult"
     can_delete: "PermissionCheckResult"
     can_load: "PermissionCheckResult"
-    can_publish: "PermissionCheckResult"
 
 
 class Project(GraphQLBaseModel):
@@ -244,3 +249,20 @@ class FileImport(GraphQLBaseModel):
 class FileUploadUrl(GraphQLBaseModel):
     url: str
     file_id: str
+
+
+class ModelIngestionStatusData(GraphQLBaseModel):
+    status: ModelIngestionStatus
+    progress_message: str | None = None
+    version_id: str | None = None
+
+
+class ModelIngestion(GraphQLBaseModel):
+    id: str
+    created_at: datetime
+    updated_at: datetime
+    model_id: str
+    project_id: str
+    user_id: str
+    cancellation_requested: bool
+    status_data: ModelIngestionStatusData

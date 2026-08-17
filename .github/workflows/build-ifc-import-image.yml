@@ -1,0 +1,129 @@
+name: Build ifc-import image
+
+# Builds our IFC importer — upstream speckle/speckle-ifc-import-service with
+# this fork's specklepy wheel installed over it — and pushes the result to
+# ghcr.io/gaiup-cram/speckle-ifc-import-service.
+#
+# Mirrors build-server-image.yml in gaiup-cram/speckle-server: the fork owns
+# its image, and the deploy repo (realtimelca-speckle-server) only pins a tag
+# (IFC_IMPORT_VERSION in speckle-version.env there).
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Tag to publish, <upstream version>-rtlca.<n>, e.g. 2.31.2-rtlca.1. The part before -rtlca. selects the upstream base image."
+        required: true
+        type: string
+      specklepy_version:
+        description: "Version stamped onto the wheel, e.g. 3.0.9+rtlca.1 — identifies the running container via importlib.metadata('specklepy')."
+        required: true
+        type: string
+      ref:
+        description: "Branch or tag of this repo to build the wheel from"
+        required: true
+        type: string
+        default: "rtlca/3.0.9"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-ifc-import-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IMAGE: ghcr.io/gaiup-cram/speckle-ifc-import-service:${{ inputs.image_tag }}
+    steps:
+      # Two checkouts: the workflow's own ref carries the Dockerfile; `ref` is
+      # the source the wheel is built from (they differ — this file lives on
+      # main, the rtlca changes live on rtlca/* branches).
+      - uses: actions/checkout@v4
+
+      - name: Derive the upstream base version from the tag
+        id: base
+        run: |
+          tag='${{ inputs.image_tag }}'
+          case "$tag" in
+            *-rtlca.*) ;;
+            *) echo "::error::image_tag must look like <upstream>-rtlca.<n>, got '$tag'"; exit 1 ;;
+          esac
+          echo "speckle_version=${tag%-rtlca.*}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the source to build
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          path: source
+          # hatch-vcs derives versions from git history, so shallow won't do.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build wheel
+        working-directory: source
+        env:
+          # Pin explicitly: the branch tip is not itself tagged, and we want
+          # the marker visible in importlib.metadata on a running container.
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.specklepy_version }}
+        run: uv build --wheel --out-dir ../utils/ifc-import-image/dist
+
+      - name: Resolve wheel filename
+        id: wheel
+        run: |
+          set -euo pipefail
+          wheels=(utils/ifc-import-image/dist/specklepy-*.whl)
+          [ ${#wheels[@]} -eq 1 ] || { echo "::error::expected exactly one wheel, got: ${wheels[*]}"; exit 1; }
+          echo "wheel=$(basename "${wheels[0]}")" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: utils/ifc-import-image
+          # Upstream publishes amd64 only.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}
+          build-args: |
+            SPECKLE_VERSION=${{ steps.base.outputs.speckle_version }}
+            WHEEL=${{ steps.wheel.outputs.wheel }}
+
+      - name: Smoke test (right specklepy baked in, imports work)
+        run: |
+          docker run --rm --platform linux/amd64 --entrypoint /app/bin/python "$IMAGE" -c "
+          import importlib.metadata as m
+          v = m.version('specklepy')
+          print('specklepy:', v)
+          assert v == '${{ inputs.specklepy_version }}', v
+          from speckleifc.property_extraction import _get_classifications
+          import ifc_importer, main
+          print('classification support present')
+          "
+
+      - name: Compare image config against the upstream base
+        env:
+          BASE: speckle/speckle-ifc-import-service:${{ steps.base.outputs.speckle_version }}
+        run: |
+          docker pull --quiet "$BASE"
+
+          config() {
+            docker inspect --format '{{json .Config}}' "$1" \
+              | jq 'with_entries(select(.key | IN("Entrypoint","Cmd","WorkingDir","User","ExposedPorts","Env")))
+                    | .Env |= sort'
+          }
+
+          diff <(config "$BASE") <(config "$IMAGE") \
+            && echo "Image config matches upstream $BASE"

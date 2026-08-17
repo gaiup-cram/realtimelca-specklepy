@@ -1,10 +1,10 @@
 import time
 from dataclasses import dataclass, field
-from typing import cast
+from typing import List, cast
 
 from ifcopenshell.entity_instance import entity_instance
 from ifcopenshell.geom import file
-from ifcopenshell.ifcopenshell_wrapper import TriangulationElement
+from ifcopenshell.ifcopenshell_wrapper import Triangulation, TriangulationElement
 
 from speckleifc.converter.data_object_converter import data_object_to_speckle
 from speckleifc.converter.geometry_converter import geometry_to_speckle
@@ -12,30 +12,61 @@ from speckleifc.converter.project_converter import project_to_speckle
 from speckleifc.converter.spatial_element_converter import spatial_element_to_speckle
 from speckleifc.ifc_geometry_processing import create_geometry_iterator
 from speckleifc.ifc_openshell_helpers import get_children
-from speckleifc.level_proxy_manager import LevelProxyManager
-from speckleifc.render_material_proxy_manager import RenderMaterialProxyManager
+from speckleifc.proxy_managers.connection_proxy_manager import ConnectionProxyManager
+from speckleifc.proxy_managers.instance_proxy_manager import InstanceProxyManager
+from speckleifc.proxy_managers.level_proxy_manager import LevelProxyManager
+from speckleifc.proxy_managers.render_material_proxy_manager import (
+    RenderMaterialProxyManager,
+)
+from speckleifc.proxy_managers.system_proxy_manager import SystemProxyManager
 from specklepy.logging.exceptions import SpeckleException
 from specklepy.objects import Base
 from specklepy.objects.data_objects import DataObject
+from specklepy.objects.models.collections.collection import Collection
+from specklepy.objects.proxies import InstanceProxy
+from specklepy.progress.ingestion_progress import IngestionProgressManager
 
 
 @dataclass
 class ImportJob:
     ifc_file: file
-    cached_display_values: dict[int, list[Base]] = field(default_factory=dict)  # noqa: F821
+
+    progress: IngestionProgressManager
+
+    emit_topology: bool = False
+    """Attach MEP topology (systemProxies + connectionProxies) to the root. Off by
+    default so the v1 output is unchanged; the 4.0 bundle path turns it on."""
+
     _render_material_manager: RenderMaterialProxyManager = field(
         default_factory=lambda: RenderMaterialProxyManager()
     )
     _level_proxy_manager: LevelProxyManager = field(
         default_factory=lambda: LevelProxyManager()
     )
+    _instance_proxy_manager: InstanceProxyManager = field(
+        default_factory=lambda: InstanceProxyManager()
+    )
+    _system_proxy_manager: SystemProxyManager = field(
+        default_factory=lambda: SystemProxyManager()
+    )
+    _connection_proxy_manager: ConnectionProxyManager = field(
+        default_factory=lambda: ConnectionProxyManager()
+    )
     geometries_count: int = 0
     geometries_used: int = 0
+    elements_converted: int = 0
     _current_storey_data_object: DataObject | None = field(default=None, init=False)
 
-    def convert_element(self, step_element: entity_instance) -> Base:
+    _display_value_cache: dict[int, list[Base]] = field(default_factory=dict)
+    """Maps an instance step ID to a list of instances"""
+
+    def convert_element(
+        self,
+        step_element: entity_instance,
+        parent_element: entity_instance | None = None,
+    ) -> Base:
         try:
-            return self._convert_element(step_element)
+            return self._convert_element(step_element, parent_element)
         except SpeckleException:
             raise
         except Exception as ex:
@@ -43,19 +74,23 @@ class ImportJob:
                 f"Failed to convert {step_element.is_a()} #{step_element.id()}"
             ) from ex
 
-    def _convert_element(self, step_element: entity_instance) -> Base:
+    def _convert_element(
+        self,
+        step_element: entity_instance,
+        parent_element: entity_instance | None = None,
+    ) -> Base:
         # Track current storey context and store for level proxies
         previous_storey_data_object = self._current_storey_data_object
         if step_element.is_a("IfcBuildingStorey"):
             # Convert the building storey to a DataObject for the level proxy
-            storey_display_value = self.cached_display_values.get(step_element.id(), [])
+            storey_display_value = self._display_value_cache.get(step_element.id(), [])
             self._current_storey_data_object = data_object_to_speckle(
-                storey_display_value, step_element, []
+                storey_display_value, step_element, [], parent_element=None
             )
 
         children = self._convert_children(step_element)
         id = step_element.id()
-        display_value = self.cached_display_values.get(id, [])
+        display_value = self._display_value_cache.get(id, [])
 
         if display_value:
             self.geometries_used += 1
@@ -75,7 +110,11 @@ class ImportJob:
             )
         else:
             result = data_object_to_speckle(
-                display_value, step_element, children, current_storey_name
+                display_value,
+                step_element,
+                children,
+                current_storey_name,
+                parent_element,
             )
             # Associate non-spatial elements with current storey for level proxies
             if self._current_storey_data_object is not None and result.applicationId:
@@ -85,11 +124,17 @@ class ImportJob:
 
         # Restore previous storey context
         self._current_storey_data_object = previous_storey_data_object
+        self.elements_converted += 1
+        if self.progress.should_report_progress():
+            self.progress.report(
+                f"Converted {self.elements_converted:,} elements", None
+            )
+
         return result
 
     def _convert_children(self, step_element: entity_instance) -> list[Base]:
         return [
-            self.convert_element(i)
+            self.convert_element(i, parent_element=step_element)
             for i in get_children(step_element)
             if self._should_convert(i)
         ]
@@ -109,12 +154,16 @@ class ImportJob:
     def convert(self) -> Base:
         start = time.time()
         self.pre_process_geometry()
-        print(f"Geometry conversion complete after {(time.time() - start) * 1000}ms")
+        print(
+            f"Geometry conversion complete after {(time.time() - start):.3f}s"  # noqa: E501
+        )
         print(f"Created {self.geometries_count} geometries")
 
         start = time.time()
         root = self._convert_project_tree()
-        print(f"Object tree conversion complete after {(time.time() - start) * 1000}ms")
+        print(
+            f"Element tree conversion complete after {(time.time() - start):.3f}s"  # noqa: E501
+        )
         print(f"Used {self.geometries_used} geometries")
         return root
 
@@ -122,23 +171,59 @@ class ImportJob:
         iterator = create_geometry_iterator(self.ifc_file)
         if not iterator.initialize():
             raise SpeckleException("Failed to find any geometry in file")
+
+        self.progress.report("Converting geometries", None)
         self.geometries_count = 0
+
         while True:
             shape = cast(TriangulationElement, iterator.get())
             self.geometries_count += 1
             id = cast(int, shape.id)
-
             try:
-                display_value = geometry_to_speckle(
-                    shape, self._render_material_manager
-                )
-                self.cached_display_values[id] = display_value
+                display_value = self._create_display_value(shape)
+                self._display_value_cache[id] = display_value
             except Exception as ex:
                 raise SpeckleException(
                     f"Failed to convert geometry with id: {id}"
                 ) from ex
+
+            if self.progress.should_report_progress():
+                self.progress.report(
+                    f"Converted {self.geometries_count:,} geometries", None
+                )
             if not iterator.next():
                 break
+
+    def _create_display_value(self, shape: TriangulationElement) -> List[Base]:
+        geometry = cast(Triangulation, shape.geometry)
+        display_value_geometry = geometry_to_speckle(
+            geometry, self._render_material_manager
+        )
+
+        definition_ids = self._instance_proxy_manager.add_display_value_definitions(
+            display_value_geometry
+        )
+        matrix = shape.transformation.matrix
+        transposed = [
+            matrix[0], matrix[4], matrix[8], matrix[12],
+            matrix[1], matrix[5], matrix[9], matrix[13],
+            matrix[2], matrix[6], matrix[10], matrix[14],
+            matrix[3], matrix[7], matrix[11], matrix[15],
+        ]  # fmt: skip
+
+        return [
+            cast(
+                Base,
+                InstanceProxy(
+                    units="m",
+                    definitionId=definition_id,
+                    transform=transposed,
+                    maxDepth=0,
+                    applicationId=f"{shape.guid}:{definition_id}",
+                ),
+            )
+            for definition_id in definition_ids
+        ]
 
     def _convert_project_tree(self) -> Base:
         projects = self.ifc_file.by_type("IfcProject", False)
@@ -146,11 +231,39 @@ class ImportJob:
             raise SpeckleException("Expected exactly one IfcProject in file")
         project = projects[0]
 
+        self.progress.report("Converting elements", None)
+
         tree = self.convert_element(project)
+        if not isinstance(tree, Collection):
+            raise TypeError("Expected root object to convert to a Collection")
+
         tree["renderMaterialProxies"] = list(
             self._render_material_manager.render_material_proxies.values()
         )
         tree["levelProxies"] = list(self._level_proxy_manager.level_proxies.values())
+        tree["instanceDefinitionProxies"] = list(
+            self._instance_proxy_manager.instance_definition_proxies.values()
+        )
+
+        # Network topology: system membership + port-connectivity edges. Extracted
+        # directly from the IFC graph (global relationships, not per-element), so run
+        # once over the whole file here. Only for the 4.0 bundle path — leaving the v1
+        # output untouched (no systemProxies / connectionProxies keys).
+        if self.emit_topology:
+            self._system_proxy_manager.extract(self.ifc_file)
+            self._connection_proxy_manager.extract(self.ifc_file)
+            tree["systemProxies"] = list(
+                self._system_proxy_manager.system_proxies.values()
+            )
+            tree["connectionProxies"] = (
+                self._connection_proxy_manager.connection_proxies
+            )
+        tree.elements.append(
+            Collection(
+                name="definitionGeometry",
+                elements=list(self._instance_proxy_manager.instance_geometry.values()),
+            )
+        )
         tree["version"] = 3
 
         return tree
