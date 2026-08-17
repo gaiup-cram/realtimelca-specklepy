@@ -1,4 +1,5 @@
 import math
+from functools import lru_cache
 from typing import Any, Optional, Tuple
 
 from ifcopenshell.entity_instance import entity_instance
@@ -161,6 +162,7 @@ def _get_materials(element: entity_instance) -> list[dict[str, Any]]:
     return materials
 
 
+@lru_cache(maxsize=4096)
 def _flatten_material_definition(definition: entity_instance) -> list[dict[str, Any]]:
     """
     One raw slot per material the definition holds, preserving declared order.
@@ -172,6 +174,12 @@ def _flatten_material_definition(definition: entity_instance) -> list[dict[str, 
     IFC2X3 lacks Name/Category/Priority on IfcMaterialLayer and Category on
     IfcMaterial, hence `getattr` with a default throughout - the same shim
     `_get_classification_identification` uses for the schema's other renames.
+
+    Cached because a model has far fewer wall build-ups than walls: attribute
+    reads on an entity_instance cross into IfcOpenShell, and re-walking one
+    shared layer set once per element was most of this module's cost. Callers
+    treat the slots as read-only. Entities hash by file and step id, so entries
+    from one file cannot answer for another.
     """
     # get_material(should_skip_usage=True) unwraps these already; belt and
     # braces in case a file associates a usage through some other route.
@@ -292,6 +300,7 @@ def _build_material_entry(
     return entry
 
 
+@lru_cache(maxsize=4096)
 def _get_material_property_sets(material: entity_instance) -> dict[str, object]:
     """
     IfcMaterialProperties hung off the material - MassDensity and friends, which
@@ -303,6 +312,10 @@ def _get_material_property_sets(material: entity_instance) -> dict[str, object]:
 
     IFC2X3 modelled these as subtypes pointing at the material instead of a
     HasProperties inverse, so this is simply empty there.
+
+    Cached for the same reason as `_flatten_material_definition`: a material's
+    density does not change between the ten thousand elements made of it, and
+    HasProperties is an inverse, which is the expensive kind of lookup.
     """
     result: dict[str, object] = {}
 
